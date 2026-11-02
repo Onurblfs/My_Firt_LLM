@@ -1,0 +1,370 @@
+WITH /*+ MATERIALIZE */
+
+-- ============================================================
+-- DIMENSAO DE CONECTIVIDADE
+-- GARANTE UMA UNICA COMBINACAO POR CD_MACRO E CD_SIGLA
+-- ============================================================
+dim_conectividade AS (
+    SELECT /*+ PARALLEL(4) */
+        CD_MACRO,
+        CD_SIGLA,
+        MAX(DSC_PLATAFORMA) AS DSC_PLATAFORMA,
+        MAX(DSC_FAMILIA)    AS DSC_FAMILIA
+    FROM BI_DIM_CD_SIGLA_MACRO
+    GROUP BY
+        CD_MACRO,
+        CD_SIGLA
+),
+
+-- ============================================================
+-- DIMENSAO DE CHARGE DO MOVEL
+-- GARANTE UMA UNICA FAMILIA POR CHARGE, PLATAFORMA E CONSIDERAR
+-- ============================================================
+dim_charge_emp AS (
+    SELECT /*+ PARALLEL(4) */
+        TRIM(COD_CHARGE_CODE) AS COD_CHARGE_CODE,
+        TRIM(TIPO_PLATAFORMA) AS TIPO_PLATAFORMA,
+        UPPER(MAX(TRIM(FAMILIA))) AS FAMILIA,
+        TRIM(CONSIDERAR) AS CONSIDERAR
+    FROM U93314735.BI_DIM_CHARGE_EMP
+    WHERE COD_CHARGE_CODE IS NOT NULL
+      AND TIPO_PLATAFORMA IS NOT NULL
+    GROUP BY
+        TRIM(COD_CHARGE_CODE),
+        TRIM(TIPO_PLATAFORMA),
+        TRIM(CONSIDERAR)
+),
+
+-- ============================================================
+-- ESTRUTURA COMERCIAL
+-- CONSIDERA A ULTIMA DATA DISPONIVEL
+-- ============================================================
+estrutura_comercial AS (
+    SELECT /*+ PARALLEL(8) */
+        TRIM(DSC_SIGLA_DIRETORIA_VENDA)
+            AS DSC_SIGLA_DIRETORIA_VENDA,
+
+        MAX(DSC_DIRETORIA_EXECUTIVA)
+            AS DSC_DIRETORIA_EXECUTIVA
+
+    FROM DWHOPR.BI_OPR_BASE_ESTRUT_COMERCIAL
+
+    WHERE IND_PRINCIPAL_CARGO = 'S'
+      AND DAT_MOVIMENTO = (
+          SELECT MAX(DAT_MOVIMENTO)
+          FROM DWHOPR.BI_OPR_BASE_ESTRUT_COMERCIAL
+      )
+
+    GROUP BY
+        TRIM(DSC_SIGLA_DIRETORIA_VENDA)
+),
+
+-- ============================================================
+-- FOTOCLE POR CNPJ COMPLETO
+-- TRAZ A RAZAO SOCIAL E A CONTA CORRENTE DO CNPJ DE 14 POSICOES
+-- ============================================================
+fotocle_cnpj AS (
+    SELECT /*+ PARALLEL(4) */
+        TRIM(CNPJ) AS CNPJ_14,
+        MAX(RAZAO_SOCIAL) AS RAZAO_SOCIAL_CNPJ,
+        MAX(CONTA_CORRENTE) AS CONTA_CORRENTE
+
+    FROM DSSGER.WCL_TB_CAD_FOTOCLE
+
+    WHERE CNPJ IS NOT NULL
+
+    GROUP BY
+        TRIM(CNPJ)
+),
+
+-- ============================================================
+-- FOTOCLE POR CNPJ RAIZ DO CONTROLADOR
+-- TRAZ DADOS DO GRUPO CONTROLADOR
+-- ============================================================
+fotocle_controlador AS (
+    SELECT /*+ PARALLEL(4) */
+        SUBSTR(TRIM(CNPJ), 1, 8) AS CNPJ_8,
+        MAX(RAZAO_SOCIAL) AS RAZAO_SOCIAL_CONTROLADOR,
+        MAX(DIRETORIA) AS DIRETORIA_CONTROLADOR,
+        MAX(DIR_NACIONAL_PARCERIA)
+            AS DIRETORIA_NACIONAL_CONTROLADOR
+
+    FROM DSSGER.WCL_TB_CAD_FOTOCLE
+
+    WHERE CNPJ IS NOT NULL
+
+    GROUP BY
+        SUBSTR(TRIM(CNPJ), 1, 8)
+),
+
+-- ============================================================
+-- SEGMENTACAO POR CNPJ COMPLETO
+-- MANTEM O REGISTRO MAIS RECENTE DE CADA NUM_CNPJ
+-- ============================================================
+seg AS (
+    SELECT
+        NUM_CNPJ,
+        NUM_RAIZ_CNPJ,
+        CNPJ_8_CONTROLADOR,
+        DSC_PORTE_EMPRESA,
+        DSC_REGIONAL_CMV,
+        RAZAO_SOCIAL_CNPJ,
+        CONTA_CORRENTE,
+        RAZAO_SOCIAL_CONTROLADOR,
+        DIRETORIA_CONTROLADOR,
+        DIRETORIA_NACIONAL_CONTROLADOR,
+        DSC_DIRETORIA_EXECUTIVA
+
+    FROM (
+        SELECT /*+ PARALLEL(8) */
+            c.NUM_CNPJ,
+            c.NUM_RAIZ_CNPJ,
+
+            c.NUM_RAIZ_CNPJ_CONTROLADOR
+                AS CNPJ_8_CONTROLADOR,
+
+            c.DSC_PORTE_EMPRESA,
+            g.DSC_REGIONAL_CMV,
+
+            fc.RAZAO_SOCIAL_CNPJ,
+            fc.CONTA_CORRENTE,
+
+            fctrl.RAZAO_SOCIAL_CONTROLADOR,
+            fctrl.DIRETORIA_CONTROLADOR,
+            fctrl.DIRETORIA_NACIONAL_CONTROLADOR,
+
+            ec.DSC_DIRETORIA_EXECUTIVA,
+
+            ROW_NUMBER() OVER (
+                PARTITION BY c.NUM_CNPJ
+                ORDER BY
+                    c.DAT_REFERENCIA DESC NULLS LAST,
+                    c.NUM_RAIZ_CNPJ_CONTROLADOR
+            ) AS rn
+
+        FROM DWH.VW_BI_HIS_SEGMENTO_CARTEIRA c
+
+        LEFT JOIN DWH.VW_BI_HIS_SEGMENTO_GRUPO g
+            ON c.NUM_RAIZ_CNPJ_CONTROLADOR =
+               g.NUM_RAIZ_CNPJ_CONTROLADOR
+
+        -- Razao social e conta corrente do CNPJ completo
+        LEFT JOIN fotocle_cnpj fc
+            ON TRIM(c.NUM_CNPJ) = fc.CNPJ_14
+
+        -- Dados do grupo controlador
+        LEFT JOIN fotocle_controlador fctrl
+            ON c.NUM_RAIZ_CNPJ_CONTROLADOR =
+               fctrl.CNPJ_8
+
+        LEFT JOIN estrutura_comercial ec
+            ON TRIM(fctrl.DIRETORIA_NACIONAL_CONTROLADOR) =
+               ec.DSC_SIGLA_DIRETORIA_VENDA
+    )
+
+    WHERE rn = 1
+),
+
+-- ============================================================
+-- BASE UNIFICADA
+-- ANO ATUAL E ANO ANTERIOR
+-- ============================================================
+bas AS (
+
+    -- ========================================================
+    -- CONECTIVIDADE
+    -- DATA_MOV NO FORMATO YYYYMM
+    -- ========================================================
+    SELECT /*+ PARALLEL(16) */
+        'CONECTIVIDADE' AS PORTIFOLIO,
+        R.CNPJ AS CNPJ_14,
+        SUBSTR(R.CNPJ, 1, 8) AS CNPJ_8,
+        R.DSC_SEGMENTACAO,
+        R.DSC_SUBGRUPO_SEGMENTACAO,
+        D.DSC_PLATAFORMA AS TP_PRODUTO,
+        D.DSC_FAMILIA AS DSC_PRODUTO,
+        R.DATA_MOV AS DT_MOV,
+        SUM(R.VALOR) AS VL_TOTAL
+
+    FROM OPS_ALTERYX.BI_FP_RECEITA_CONECTIVIDADE_NS R
+
+    LEFT JOIN dim_conectividade D
+        ON R.CD_MACRO = D.CD_MACRO
+       AND R.SIGLA_SERV = D.CD_SIGLA
+
+    WHERE R.DATA_MOV >= TO_CHAR(
+              ADD_MONTHS(TRUNC(SYSDATE, 'YEAR'), -12),
+              'YYYYMM'
+          )
+
+      AND R.DATA_MOV < TO_CHAR(
+              ADD_MONTHS(TRUNC(SYSDATE, 'YEAR'), 12),
+              'YYYYMM'
+          )
+
+      AND R.DSC_SEGMENTACAO IN (
+          'GE',
+          'ME',
+          'PE',
+          'BRK'
+      )
+
+    GROUP BY
+        R.CNPJ,
+        R.DSC_SEGMENTACAO,
+        R.DSC_SUBGRUPO_SEGMENTACAO,
+        D.DSC_PLATAFORMA,
+        D.DSC_FAMILIA,
+        R.DATA_MOV
+
+    UNION ALL
+
+    -- ========================================================
+    -- FIXA
+    -- ========================================================
+    SELECT /*+ PARALLEL(16) */
+        'FIXA' AS PORTIFOLIO,
+        NUM_CNPJ AS CNPJ_14,
+        SUBSTR(NUM_CNPJ, 1, 8) AS CNPJ_8,
+        DSC_SEGMENTO AS DSC_SEGMENTACAO,
+        DSC_SUBGRUPO AS DSC_SUBGRUPO_SEGMENTACAO,
+        TP_PRODUTO,
+
+        CASE
+            WHEN TP_PRODUTO = 'TV'
+                THEN 'HFC'
+
+            WHEN TP_PRODUTO IN ('NT', 'BL')
+                THEN 'CLARO FIBRA'
+
+            ELSE NULL
+        END AS DSC_PRODUTO,
+
+        TO_CHAR(DT_COMPETENCIA, 'YYYYMM') AS DT_MOV,
+        SUM(VL_CALCULADO) AS VL_TOTAL
+
+    FROM OPS_ALTERYX.DM_RECEITA_NETSMS_NS
+
+    WHERE DT_COMPETENCIA >=
+          ADD_MONTHS(TRUNC(SYSDATE, 'YEAR'), -12)
+
+      AND DT_COMPETENCIA <
+          ADD_MONTHS(TRUNC(SYSDATE, 'YEAR'), 12)
+
+      AND DSC_SEGMENTO IN (
+          'GE',
+          'ME',
+          'PE',
+          'BRK'
+      )
+
+    GROUP BY
+        NUM_CNPJ,
+        DSC_SEGMENTO,
+        DSC_SUBGRUPO,
+        TP_PRODUTO,
+        DT_COMPETENCIA
+
+    UNION ALL
+
+    -- ========================================================
+    -- MOVEL
+    -- DSC_PRODUTO RECEBE FAMILIA EM CAIXA ALTA
+    -- JOIN POR COD_CHARGE_CODE E TIPO_PLATAFORMA
+    -- FILTRO CONSIDERAR = 'S' APLICADO SOMENTE NO MOVEL
+    -- ========================================================
+    SELECT /*+ PARALLEL(16) */
+        'MOVEL' AS PORTIFOLIO,
+        M.NUM_CNPJ AS CNPJ_14,
+        SUBSTR(M.NUM_CNPJ, 1, 8) AS CNPJ_8,
+        M.DSC_SEGMENTACAO,
+        M.DSC_SUBGRUPO_SEGMENTACAO,
+
+        SUBSTR(
+            M.TIPO_PLATAFORMA,
+            INSTR(M.TIPO_PLATAFORMA, '-') + 2
+        ) AS TP_PRODUTO,
+
+        DC.FAMILIA AS DSC_PRODUTO,
+
+        TO_CHAR(M.DT_REFERENCIA, 'YYYYMM') AS DT_MOV,
+        SUM(M.VAL_TARIFADO) AS VL_TOTAL
+
+    FROM OPS_ALTERYX.DM_VISAO_SIMULADOR_MOVEL_NS M
+
+    LEFT JOIN dim_charge_emp DC
+        ON TRIM(M.COD_CHARGE_CODE) = DC.COD_CHARGE_CODE
+       AND TRIM(M.TIPO_PLATAFORMA) = DC.TIPO_PLATAFORMA
+
+    WHERE M.DT_REFERENCIA >=
+          ADD_MONTHS(TRUNC(SYSDATE, 'YEAR'), -12)
+
+      AND M.DT_REFERENCIA <
+          ADD_MONTHS(TRUNC(SYSDATE, 'YEAR'), 12)
+
+      AND M.DSC_SEGMENTACAO IN (
+          'GE',
+          'ME',
+          'PE',
+          'BRK'
+      )
+
+      AND M.NM_INDICADOR IN (
+          'PIS',
+          'COFINS',
+          'ISS',
+          'FATURAMENTO',
+          'ICMS',
+          'AJUSTE',
+          'PIS-ADJ',
+          'COFINS-ADJ'
+      )
+
+      AND M.VAL_TARIFADO <> 0
+      AND M.GL_ACC_NO IS NOT NULL
+      AND M.ORIGEM = 'BILLED'
+      AND DC.CONSIDERAR = 'S'
+
+    GROUP BY
+        M.NUM_CNPJ,
+        M.DSC_SEGMENTACAO,
+        M.DSC_SUBGRUPO_SEGMENTACAO,
+        M.TIPO_PLATAFORMA,
+        DC.FAMILIA,
+        M.DT_REFERENCIA
+)
+
+-- ============================================================
+-- RESULTADO FINAL
+-- RELACIONAMENTO PELO CNPJ COMPLETO
+-- ============================================================
+SELECT /*+ PARALLEL(8) */
+    b.PORTIFOLIO,
+    b.CNPJ_14,
+    b.CNPJ_8,
+    b.DSC_SEGMENTACAO,
+    b.DSC_SUBGRUPO_SEGMENTACAO,
+    b.TP_PRODUTO,
+    b.DSC_PRODUTO,
+    b.DT_MOV,
+    b.VL_TOTAL,
+
+    seg.NUM_RAIZ_CNPJ,
+    seg.DSC_PORTE_EMPRESA,
+    seg.DSC_REGIONAL_CMV,
+
+    -- Informacoes exatas do CNPJ completo da receita
+    seg.RAZAO_SOCIAL_CNPJ,
+    seg.CONTA_CORRENTE,
+
+    -- Informacoes do grupo controlador
+    seg.CNPJ_8_CONTROLADOR,
+    seg.RAZAO_SOCIAL_CONTROLADOR,
+    seg.DIRETORIA_CONTROLADOR,
+    seg.DIRETORIA_NACIONAL_CONTROLADOR,
+    seg.DSC_DIRETORIA_EXECUTIVA
+
+FROM bas b
+
+LEFT JOIN seg
+    ON TRIM(b.CNPJ_14) = TRIM(seg.NUM_CNPJ)
